@@ -45,8 +45,15 @@ stages:
               provider: 'azurerm'
               command: 'plan'
               environmentServiceNameAzureRM: 'TF-SERVICE-CONNECTION'
-              commandOptions: '-out=tfplan'
+              commandOptions: '-out=tfplan -var="backend_rg=$(ARM_BACKEND_RG)" -var="backend_sa=$(ARM_BACKEND_SA)" -var="backend_container=$(ARM_BACKEND_CONTAINER)"'
 
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Terraform Plan'
+            inputs:
+              targetPath: '$(System.DefaultWorkingDirectory)/tfplan'
+              artifact: 'terraform_plan'
+              publishLocation: 'pipeline'
+              
   - stage: CD_APPLY
     displayName: 'Deployment (Apply)'
     dependsOn: CI_SCAN_PLAN
@@ -59,13 +66,34 @@ stages:
           runOnce:
             deploy:
               steps:
+                - checkout: self  
+                
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download Terraform Plan'
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'terraform_plan'
+                    targetPath: '$(System.DefaultWorkingDirectory)'
+
                 - task: TerraformInstaller@1
                   displayName: 'Install Terraform'
 
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Init'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'init'
+                    backendType: 'azurerm'
+                    backendServiceArm: 'TF-SERVICE-CONNECTION'
+                    backendAzureRmResourceGroupName: $(ARM_BACKEND_RG)
+                    backendAzureRmStorageAccountName: $(ARM_BACKEND_SA)
+                    backendAzureRmContainerName: $(ARM_BACKEND_CONTAINER)
+                    backendAzureRmKey: 'day2-lab.terraform.tfstate'
+                
                 - task: TerraformTaskV4@4
                   displayName: 'Terraform Apply'
                   inputs:
                     provider: 'azurerm'
                     command: 'apply'
                     environmentServiceNameAzureRM: 'TF-SERVICE-CONNECTION'
-                    commandOptions: 'tfplan' # apply using the saved plan
+                    commandOptions: 'tfplan'
