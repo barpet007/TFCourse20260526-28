@@ -1,0 +1,223 @@
+trigger:
+  branches:
+    include:
+      - develop
+      - main
+
+pr: none
+
+parameters:
+  - name: environmentMode
+    displayName: Deployment environment
+    type: string
+    default: auto
+    values:
+      - auto
+      - dev
+      - prod
+
+  - name: terraformAction
+    displayName: Terraform action
+    type: string
+    default: apply
+    values:
+      - plan
+      - apply
+      - destroy
+
+variables:
+  - group: TF-SECRETS
+
+stages:
+  - stage: ApprovalGate
+    displayName: 'Approval gate for PRD'
+    condition: and(or(eq('${{ parameters.environmentMode }}', 'prod'), and(eq('${{ parameters.environmentMode }}', 'auto'), eq(variables['Build.SourceBranchName'], 'main'))), eq(variables['Build.SourceBranchName'], 'main'))
+    jobs:
+      - job: WaitForApproval
+        displayName: 'Manual approval before PRD CI'
+        pool: server
+        steps:
+          - task: ManualValidation@0
+            inputs:
+              notifyUsers: ''
+              instructions: 'Approve to start PRD CI'
+              onTimeout: 'reject'
+            timeoutInMinutes: 4320
+
+  - stage: CI
+    displayName: 'CI: Validate, Scan and Plan'
+    dependsOn: ApprovalGate
+    condition: or(eq('${{ parameters.environmentMode }}', 'dev'), eq('${{ parameters.environmentMode }}', 'prod'), and(eq('${{ parameters.environmentMode }}', 'auto'), ne(variables['Build.SourceBranchName'], 'main')), and(eq('${{ parameters.environmentMode }}', 'auto'), eq(variables['Build.SourceBranchName'], 'main'), succeeded('ApprovalGate')))
+    jobs:
+      - job: Plan
+        displayName: 'Validate and create plan'
+        steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: 'Resolve deployment settings'
+            inputs:
+              targetType: inline
+              script: |
+                $mode = '${{ parameters.environmentMode }}'
+                $action = '${{ parameters.terraformAction }}'
+                $branch = "$(Build.SourceBranchName)"
+
+                if ($mode -eq 'auto') {
+                  if ($branch -eq 'main') {
+                    $mode = 'prod'
+                  }
+                  else {
+                    $mode = 'dev'
+                  }
+                }
+
+                $tfvarsFile = if ($mode -eq 'prod') { 'prod.tfvars' } else { 'dev.tfvars' }
+                $backendKey = if ($mode -eq 'prod') { 'lab03-prod.tfstate' } else { 'lab03-dev.tfstate' }
+                $planFlags = if ($action -eq 'destroy') { "-destroy -var-file=$tfvarsFile -out=tfplan" } else { "-var-file=$tfvarsFile -out=tfplan" }
+
+                Write-Host "##vso[task.setvariable variable=selectedEnvironment]$mode"
+                Write-Host "##vso[task.setvariable variable=selectedAction]$action"
+                Write-Host "##vso[task.setvariable variable=tfvarsFile]$tfvarsFile"
+                Write-Host "##vso[task.setvariable variable=backendKey]$backendKey"
+                Write-Host "##vso[task.setvariable variable=planFlags]$planFlags"
+
+          - task: TerraformInstaller@1
+            displayName: 'Install Terraform'
+            inputs:
+              terraformVersion: 'latest'
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install checkov
+            displayName: 'Install Checkov'
+
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Init'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              backendType: 'azurerm'
+              backendServiceArm: $(SERVICE_CONNECTION_NAME)
+              backendAzureRmResourceGroupName: $(BACKEND_RG_NAME)
+              backendAzureRmStorageAccountName: $(BACKEND_SA_NAME)
+              backendAzureRmContainerName: $(BACKEND_CONTAINER_NAME)
+              backendAzureRmKey: $(backendKey)
+
+          - script: |
+              checkov --directory . --framework terraform --external-checks-dir ./checkov/custom_policies
+            displayName: 'Checkov Security Scan'
+
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Plan'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              commandOptions: '$(planFlags)'
+              environmentServiceNameAzureRM: $(SERVICE_CONNECTION_NAME)
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Terraform Plan'
+            inputs:
+              targetPath: '$(System.DefaultWorkingDirectory)/tfplan'
+              artifact: 'terraform_plan'
+              publishLocation: 'pipeline'
+
+  - stage: CD
+    displayName: 'CD: Apply or Destroy'
+    dependsOn: CI
+    condition: succeeded()
+    jobs:
+      - deployment: DevDeploy
+        displayName: 'DEV deployment'
+        condition: and(succeeded(), or(eq('${{ parameters.environmentMode }}', 'dev'), and(eq('${{ parameters.environmentMode }}', 'auto'), ne(variables['Build.SourceBranchName'], 'main'))), ne('${{ parameters.terraformAction }}', 'plan'))
+        environment: 'DEV-LAB03'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download Terraform Plan'
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'terraform_plan'
+                    targetPath: '$(System.DefaultWorkingDirectory)'
+                - task: TerraformInstaller@1
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: 'latest'
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Init'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'init'
+                    backendType: 'azurerm'
+                    backendServiceArm: $(SERVICE_CONNECTION_NAME)
+                    backendAzureRmResourceGroupName: $(BACKEND_RG_NAME)
+                    backendAzureRmStorageAccountName: $(BACKEND_SA_NAME)
+                    backendAzureRmContainerName: $(BACKEND_CONTAINER_NAME)
+                    backendAzureRmKey: $(backendKey)
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Apply'
+                  condition: ne(variables['selectedAction'], 'destroy')
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'apply'
+                    commandOptions: 'tfplan'
+                    environmentServiceNameAzureRM: $(SERVICE_CONNECTION_NAME)
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Destroy'
+                  condition: eq(variables['selectedAction'], 'destroy')
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'apply'
+                    commandOptions: 'tfplan'
+                    environmentServiceNameAzureRM: $(SERVICE_CONNECTION_NAME)
+
+      - deployment: ProdDeploy
+        displayName: 'PRD deployment'
+        condition: and(succeeded(), or(eq('${{ parameters.environmentMode }}', 'prod'), and(eq('${{ parameters.environmentMode }}', 'auto'), eq(variables['Build.SourceBranchName'], 'main'))), ne('${{ parameters.terraformAction }}', 'plan'))
+        environment: 'PRD-LAB03'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download Terraform Plan'
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'terraform_plan'
+                    targetPath: '$(System.DefaultWorkingDirectory)'
+                - task: TerraformInstaller@1
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: 'latest'
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Init'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'init'
+                    backendType: 'azurerm'
+                    backendServiceArm: $(SERVICE_CONNECTION_NAME)
+                    backendAzureRmResourceGroupName: $(BACKEND_RG_NAME)
+                    backendAzureRmStorageAccountName: $(BACKEND_SA_NAME)
+                    backendAzureRmContainerName: $(BACKEND_CONTAINER_NAME)
+                    backendAzureRmKey: $(backendKey)
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Apply'
+                  condition: ne(variables['selectedAction'], 'destroy')
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'apply'
+                    commandOptions: 'tfplan'
+                    environmentServiceNameAzureRM: $(SERVICE_CONNECTION_NAME)
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Destroy'
+                  condition: eq(variables['selectedAction'], 'destroy')
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'apply'
+                    commandOptions: 'tfplan'
+                    environmentServiceNameAzureRM: $(SERVICE_CONNECTION_NAME)
